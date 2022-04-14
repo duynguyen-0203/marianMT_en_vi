@@ -7,6 +7,7 @@ import sys
 from tqdm import tqdm
 
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import transformers
 from torch.optim import AdamW
 from transformers import MarianTokenizer, MarianMTModel
@@ -41,6 +42,8 @@ class Trainer:
         self._log_dataset(train_dataset, valid_dataset)
         n_train_samples = len(train_dataset)
         updates_epoch = n_train_samples // args.train_batch_size
+        if args.steps_per_epoch is not None and updates_epoch > args.steps_per_epoch:
+            updates_epoch = args.steps_per_epoch
         n_updates = updates_epoch * args.epochs
 
         self._logger.info('--------- Running training ---------')
@@ -85,8 +88,17 @@ class Trainer:
         }
         torch.save(saved_point, save_path)
 
-    def _eval(self, model, dataset, epoch):
-        self._logger.info(f'Evaluate epoch {epoch}')
+    def _load_model(self, model_path):
+        saved_point = torch.load(model_path, map_location=self._device)
+
+        return saved_point['model']
+
+    def _eval(self, model, dataset, epoch=None):
+        if epoch is not None:
+            self._logger.info(f'Evaluate epoch {epoch}')
+            desc = f'Evaluate epoch {epoch}'
+        else:
+            desc = 'Evaluate epoch'
         evaluator = Evaluator(dataset, self._tokenizer)
         dataset.set_mode(Dataset.EVAL_MODE)
         data_loader = DataLoader(dataset, batch_size=self.args.eval_batch_size, shuffle=False, drop_last=False,
@@ -95,15 +107,29 @@ class Trainer:
         with torch.no_grad():
             model.eval()
             total = math.ceil(len(dataset) / self.args.eval_batch_size)
-            for batch in tqdm(data_loader, total=total, desc=f'Evaluate epoch {epoch}'):
+            for batch in tqdm(data_loader, total=total, desc=desc):
                 batch = utils.to_device(batch, self._device)
                 generated_tokens = model.generate(inputs=batch['encoding'], pad_token_id=self._tokenizer.pad_token_id)
                 evaluator.eval_batch(generated_tokens)
 
         score = evaluator.compute_scores()
-        self._log_eval(score, epoch)
+        if self.args.mode == 'train':
+            self._log_eval(score, epoch)
 
         return score['bleu']
+
+    def eval(self):
+        args = self.args
+        model = self._load_model(args.saved_model_path)
+        model.to(self._device)
+        reader = Reader(self._tokenizer)
+        dataset = reader.read(args.src_test_data, args.tgt_test_data, args.test_data_name, args.max_length)
+        self._logger.info(f'Dataset: {self.args.data_name}')
+        self._logger.info(f'Test dataset: {len(dataset)} samples')
+
+        self._logger.info('--------- Evaluation phrase ---------')
+        score = self._eval(model, dataset, epoch=None)
+        self._logger.info('BLEU score: {}'.format(score))
 
     def _train_epoch(self, model, loss_calculator, scheduler, dataset, epoch):
         self._logger.info(f'--------- EPOCH {epoch} ---------')
@@ -113,8 +139,10 @@ class Trainer:
         model.zero_grad()
         iteration = 0
         total = len(dataset) // self.args.train_batch_size
+        if self.args.steps_per_epoch is not None and total > self.args.steps_per_epoch:
+            total = self.args.steps_per_epoch
 
-        for batch in tqdm(data_loader, total=total, desc=f'Train epoch {epoch}'):
+        for batch in tqdm(data_loader, total=total - 1, desc=f'Train epoch {epoch}'):
             model.train()
             batch = utils.to_device(batch, self._device)
             logits = model(input_ids=batch['encoding'], attention_mask=batch['attention_mask'],
@@ -126,30 +154,39 @@ class Trainer:
                 self._log_train(scheduler, batch_loss, epoch, iteration, global_iteration)
 
             iteration += 1
+            if self.args.steps_per_epoch is not None and iteration == self.args.steps_per_epoch:
+                break
 
         return iteration
 
     def _init_logger(self):
         time = str(datetime.now()).replace(' ', '_').replace(':', '-')
-        self._path = os.path.join(self.args.save_path, time)
-        self._log_path = os.path.join(self._path, 'log')
-        os.makedirs(self._path, exist_ok=True)
-        os.makedirs(self._log_path, exist_ok=True)
-
         log_formatter = logging.Formatter('%(asctime)s [%(threadName)-12.12s [%(levelname)-5.5s] %(message)s')
         self._logger = logging.getLogger()
         logger_utils.reset_logger(self._logger)
 
-        file_handler = logging.FileHandler(os.path.join(self._log_path, 'all.log'))
+        if self.args.mode == 'train':
+            self._path = os.path.join(self.args.save_path, time)
+            self._log_path = os.path.join(self._path, 'log')
+            os.makedirs(self._path, exist_ok=True)
+            os.makedirs(self._log_path, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(self._log_path, 'all.log'))
+            self._init_csv_logger()
+            # init tensorboard logger
+            os.makedirs(self.args.tensorboard_path, exist_ok=True)
+            self._writer = SummaryWriter(os.path.join(self.args.tensorboard_path, time))
+        else:
+            self._eval_path = os.path.join(self.args.eval_path, time)
+            os.makedirs(self._eval_path, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(self._eval_path, 'all.log'))
+
         file_handler.setFormatter(log_formatter)
         self._logger.addHandler(file_handler)
 
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(log_formatter)
         self._logger.addHandler(console_handler)
-
         self._logger.setLevel(logging.INFO)
-        self._init_csv_logger()
 
     def _get_optimizer_params(self, model):
         param_optimizer = list(model.named_parameters())
@@ -194,10 +231,14 @@ class Trainer:
         logger_utils.log_csv(self._loss_csv, data)
         self._logger.info(f'Training loss at epoch {epoch}, iteration {iteration}, global iteration {global_iteration}:'
                           f' {loss}')
+        self._writer.add_scalar('Training loss per iteration', loss, global_step=global_iteration)
+        self._writer.add_scalar('Learning rate', lr[0], global_step=global_iteration)
 
     def _log_eval(self, score, epoch):
         self._logger.info(f"BLEU score at epoch {epoch}: {score['bleu']}")
         logger_utils.log_csv(self._eval_csv, [epoch, score['bleu'], score['length_ratio']])
+        self._writer.add_scalar('Validation BLEU score per epoch', score['bleu'], global_step=epoch)
+        self._writer.add_scalar('Validation length ratio per epoch', score['length_ratio'], global_step=epoch)
 
     def _init_csv_logger(self):
         self._loss_csv = os.path.join(self._log_path, 'loss.csv')

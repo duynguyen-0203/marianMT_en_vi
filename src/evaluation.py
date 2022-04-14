@@ -39,7 +39,9 @@ def convert_tokens(tokens: List[str]):
             res.append(token[1:])
         elif token in string.punctuation:
             res.append(token)
-        else:
+        elif len(res) != 0:
             res[-1] += token
+        else:
+            res.append(token)
 
     return res
