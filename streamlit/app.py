@@ -18,10 +18,11 @@ def prediction(tokenizer, model, source):
     sample = create_eval_sample(sample, tokenizer=tokenizer, max_length=args.max_length)
     # prediction
     inputs = torch.tensor([sample['encoding'].tolist()], device=device)
-    generated_tokens = model.generate(inputs=inputs, pad_token_id=tokenizer.pad_token_id)
-    target = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+    outputs = model.generate(inputs=inputs, pad_token_id=tokenizer.pad_token_id, output_scores=True,
+                                      return_dict_in_generate=True)
+    target = tokenizer.decode(outputs['sequences'][0], skip_special_tokens=True)
 
-    return target
+    return target, outputs['sequences_scores'][0].item()
 
 
 def app(tokenizer, model):
@@ -30,9 +31,10 @@ def app(tokenizer, model):
                            placeholder='Enter the English sentence you want to translate')
 
     with st.spinner('Wait for it...'):
-        target = prediction(tokenizer, model, source)
+        target, score = prediction(tokenizer, model, source)
 
     st.write('**Vietnamese sentence:**', target)
+    st.write('**Confidence score:**', score)
 
 
 if __name__ == '__main__':
